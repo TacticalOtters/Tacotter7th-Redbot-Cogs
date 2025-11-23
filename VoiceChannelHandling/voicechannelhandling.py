@@ -50,6 +50,7 @@ class VoiceChannelHandling(VCCCommandsMixin, commands.Cog):
             "temp_channels": [],
             # Next counter value for {counter} placeholder.
             "counter": 1,
+            "owner_channels": {}, # key: str(user_id), value: channel_id
         }
 
         self.config.register_guild(**default_guild)
@@ -259,19 +260,32 @@ class VoiceChannelHandling(VCCCommandsMixin, commands.Cog):
         member: discord.Member,
         base_channel: discord.VoiceChannel,
     ) -> None:
-        """Create a temp channel for `member` and move them into it."""
+        """Create or reuse a temp channel for `member` and move them into it."""
         guild = base_channel.guild
         guild_conf = self.config.guild(guild)
 
+        # 1) Check if this user already has a temp channel
+        existing_id = await self._get_owner_channel_id(guild, member.id)
+        if existing_id is not None:
+            existing_channel = guild.get_channel(existing_id)
+            if isinstance(existing_channel, discord.VoiceChannel):
+                # Cancel pending delete for that channel, if any
+                self._cancel_delete_task(existing_channel.id)
+
+                # Just move them back into their existing channel
+                try:
+                    await member.move_to(existing_channel)
+                except discord.HTTPException:
+                    pass
+                return
+            # If mapping was stale, we cleaned it in _get_owner_channel_id
+
+        # 2) No existing channel: create a new one
         name_template = await guild_conf.name_template()
         counter = await self.get_next_counter(guild)
         channel_name = self._render_channel_name(name_template, member, counter)
 
-
-        # Copy permission overwrites from the base channel.
         overwrites = base_channel.overwrites.copy()
-
-        # Grant the member management permissions on their own temp channel.
         overwrites[member] = discord.PermissionOverwrite(
             manage_channels=True,
             move_members=True,
@@ -280,24 +294,18 @@ class VoiceChannelHandling(VCCCommandsMixin, commands.Cog):
         )
 
         me = guild.me
-        # Check the bot has the required permissions.
         if not me.guild_permissions.manage_channels or not me.guild_permissions.move_members:
-            # If we do not have perms, silently skip. A command module can later
-            # add logging or feedback if required.
             return
 
-        # Category selection: prefer configured temp_category, else base channel's category.
         temp_category_id = await guild_conf.temp_category_id()
         category = None
         if temp_category_id is not None:
             cat_obj = guild.get_channel(temp_category_id)
             if isinstance(cat_obj, discord.CategoryChannel):
                 category = cat_obj
-
         if category is None:
             category = base_channel.category
 
-        # Create the new voice channel.
         new_channel = await guild.create_voice_channel(
             name=channel_name,
             category=category,
@@ -305,14 +313,12 @@ class VoiceChannelHandling(VCCCommandsMixin, commands.Cog):
             reason="Temporary voice channel created by VoiceChannelHandling cog.",
         )
 
-        # Track as temporary in config.
         await self._add_temp_channel(guild, new_channel.id)
+        await self._set_owner_channel(guild, member.id, new_channel.id)
 
-        # Move the member to the new channel.
         try:
             await member.move_to(new_channel)
         except discord.HTTPException:
-            # Move failure is non-critical; channel still exists and is managed.
             pass
 
     def _render_channel_name(self, template: str, member: discord.Member, counter: int) -> str:
@@ -376,6 +382,7 @@ class VoiceChannelHandling(VCCCommandsMixin, commands.Cog):
 
                 # Remove from config list.
                 await self._remove_temp_channel(guild, channel_id)
+                await self._clear_owner_by_channel(guild, channel_id)
 
         finally:
             # Clean up task reference.
@@ -402,3 +409,31 @@ class VoiceChannelHandling(VCCCommandsMixin, commands.Cog):
         async with self.config.guild(guild).temp_channels() as channels:
             if channel_id in channels:
                 channels.remove(channel_id)
+    
+    async def _set_owner_channel(self, guild: discord.Guild, user_id: int, channel_id: int) -> None:
+        """Set or update the temp channel owned by a specific user."""
+        async with self.config.guild(guild).owner_channels() as owners:
+            owners[str(user_id)] = channel_id
+
+    async def _get_owner_channel_id(self, guild: discord.Guild, user_id: int) -> Optional[int]:
+        """Get the temp channel ID owned by this user, if any and still valid."""
+        owners = await self.config.guild(guild).owner_channels()
+        chan_id = owners.get(str(user_id))
+        if chan_id is None:
+            return None
+
+        channel = guild.get_channel(chan_id)
+        if not isinstance(channel, discord.VoiceChannel):
+            # Channel no longer exists, clean up mapping
+            async with self.config.guild(guild).owner_channels() as owners_mut:
+                owners_mut.pop(str(user_id), None)
+            return None
+
+        return chan_id
+
+    async def _clear_owner_by_channel(self, guild: discord.Guild, channel_id: int) -> None:
+        """Remove any owner entries pointing to a specific channel."""
+        async with self.config.guild(guild).owner_channels() as owners:
+            to_delete = [uid for uid, cid in owners.items() if cid == channel_id]
+            for uid in to_delete:
+                owners.pop(uid, None)

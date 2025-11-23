@@ -3,13 +3,23 @@ import json
 from pathlib import Path
 from typing import Dict, Optional, List
 
+# ==========================================================
+# Discord and red bot imports
+# ==========================================================
+
 import discord
 from redbot.core import commands, Config
 from redbot.core.data_manager import cog_data_path
+
+# ==========================================================
+# Module imports
+# ==========================================================
+
 from .VCC.commands_mixin import VCCCommandsMixin
+from .VCC.VCOwnerCommand import VCOwnerCommandsMixin
 
 
-class VoiceChannelHandling(VCCCommandsMixin, commands.Cog):
+class VoiceChannelHandling(VCCCommandsMixin, VCOwnerCommandsMixin, commands.Cog):
     """Temporary voice channel handling cog.
 
     Responsibilities:

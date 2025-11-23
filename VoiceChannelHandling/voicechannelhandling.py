@@ -48,6 +48,8 @@ class VoiceChannelHandling(VCCCommandsMixin, commands.Cog):
             "temp_category_id": None,
             # List of channel IDs considered temporary for this guild.
             "temp_channels": [],
+            # Next counter value for {counter} placeholder.
+            "counter": 1,
         }
 
         self.config.register_guild(**default_guild)
@@ -120,6 +122,15 @@ class VoiceChannelHandling(VCCCommandsMixin, commands.Cog):
     async def get_temp_channels(self, guild: discord.Guild) -> List[int]:
         """Get the list of tracked temp channel IDs for this guild."""
         return await self.config.guild(guild).temp_channels()
+    
+    async def get_next_counter(self, guild: discord.Guild) -> int:
+        """Get the next counter value for this guild and increment it."""
+        conf = self.config.guild(guild)
+        current = await conf.counter()
+        if current is None or current < 1:
+            current = 1
+        await conf.counter.set(current + 1)
+        return current
 
     # ==========================================================
     # Hybrid command: SetupVCH (creates JSON DB + config)
@@ -253,7 +264,9 @@ class VoiceChannelHandling(VCCCommandsMixin, commands.Cog):
         guild_conf = self.config.guild(guild)
 
         name_template = await guild_conf.name_template()
-        channel_name = self._render_channel_name(name_template, member)
+        counter = await self.get_next_counter(guild)
+        channel_name = self._render_channel_name(name_template, member, counter)
+
 
         # Copy permission overwrites from the base channel.
         overwrites = base_channel.overwrites.copy()
@@ -302,10 +315,23 @@ class VoiceChannelHandling(VCCCommandsMixin, commands.Cog):
             # Move failure is non-critical; channel still exists and is managed.
             pass
 
-    def _render_channel_name(self, template: str, member: discord.Member) -> str:
-        """Render channel name, falling back to a safe default if needed."""
+    def _render_channel_name(self, template: str, member: discord.Member, counter: int) -> str:
+        """Render channel name, falling back to a safe default if needed.
+
+        Available placeholders:
+        - {user}: member.display_name
+        - {id}: member.id
+        - {tag}: str(member) (usually Name#1234)
+        - {counter}: auto-incrementing integer per guild
+        """
+        tag = str(member)
         try:
-            return template.format(user=member.display_name, id=member.id)
+            return template.format(
+                user=member.display_name,
+                id=member.id,
+                tag=tag,
+                counter=counter,
+            )
         except Exception:
             return f"{member.display_name}'s channel"
 

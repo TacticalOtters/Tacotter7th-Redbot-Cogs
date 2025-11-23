@@ -290,3 +290,107 @@ class VCOwnerCommandsMixin:
             return None
 
         return channel
+    
+    # ----------------------------------------------------------
+    # /voicechannelhandling rename
+    # ----------------------------------------------------------
+    
+    @vch_owner_group.command(name="rename")
+    @commands.guild_only()
+    async def vch_owner_rename(
+        self,
+        ctx: commands.Context,
+        *,
+        new_name: str,
+    ):
+        """
+        Rename your temporary voice channel.
+
+        This can be used by:
+        - The current owner of the temp channel, or
+        - Any member with the Manage Channels permission.
+
+        You must be inside the temporary voice channel you want to rename.
+        """
+        guild = ctx.guild
+        if guild is None:
+            return
+
+        author = ctx.author
+        if not isinstance(author, discord.Member):
+            return
+
+        # Must be in a voice channel
+        if not author.voice or not isinstance(author.voice.channel, discord.VoiceChannel):
+            await ctx.send(
+                "You must be connected to a temporary voice channel to use this command.",
+                ephemeral=True,
+            )
+            return
+
+        channel = author.voice.channel
+
+        # Check that this is a managed temp channel
+        temp_channels = await self.get_temp_channels(guild)
+        if channel.id not in temp_channels:
+            await ctx.send(
+                "This command can only be used inside a managed temporary voice channel.",
+                ephemeral=True,
+            )
+            return
+
+        # Check ownership OR Manage Channels permission
+        owners = await self.config.guild(guild).owner_channels()
+        chan_owner_id = None
+        for uid_str, cid in owners.items():
+            if cid == channel.id:
+                try:
+                    chan_owner_id = int(uid_str)
+                except ValueError:
+                    chan_owner_id = None
+                break
+
+        is_owner = chan_owner_id == author.id
+        has_manage = author.guild_permissions.manage_channels
+
+        if not is_owner and not has_manage:
+            await ctx.send(
+                "Only the owner of this temporary voice channel or a moderator "
+                "with Manage Channels permission can rename it.",
+                ephemeral=True,
+            )
+            return
+
+        # Basic sanity for the new name
+        new_name = new_name.strip()
+        if not new_name:
+            await ctx.send(
+                "Channel name cannot be empty.",
+                ephemeral=True,
+            )
+            return
+
+        if len(new_name) > 100:
+            await ctx.send(
+                "Channel name is too long. Please use 100 characters or fewer.",
+                ephemeral=True,
+            )
+            return
+
+        try:
+            await channel.edit(
+                name=new_name,
+                reason="Temporary voice channel renamed by owner/mod.",
+            )
+        except discord.HTTPException:
+            await ctx.send(
+                "Failed to rename this channel. Please try again later.",
+                ephemeral=True,
+            )
+            return
+
+        await ctx.send(
+            f"Channel has been renamed to `{new_name}`.",
+            ephemeral=True,
+        )
+

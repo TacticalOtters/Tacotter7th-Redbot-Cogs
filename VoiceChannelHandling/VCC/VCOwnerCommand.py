@@ -120,7 +120,6 @@ class VCOwnerCommandsMixin:
 
         await ctx.send(
             f"Ownership of this temporary voice channel has been transferred to {new_owner.mention}.",
-            f"New name: `{new_name}`",
             ephemeral=True,
         )
 

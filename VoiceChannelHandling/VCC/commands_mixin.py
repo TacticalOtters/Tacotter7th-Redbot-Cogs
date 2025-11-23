@@ -124,10 +124,16 @@ class VCCCommandsMixin:
         """
         Set the name template for temporary voice channels.
 
-        Use {user} for the joining user's display name and {id} for their ID.
-        Example:
+        Available placeholders:
+        - {user}    -> joining user's display name
+        - {id}      -> joining user's ID
+        - {tag}     -> joining user's tag (Name#1234)
+        - {counter} -> auto-incrementing channel counter (1, 2, 3, ...)
+
+        Examples:
             {user}'s squad
             VC-{id}
+            Table #{counter} for {user} ({tag})
         """
         guild = ctx.guild
         if guild is None:
@@ -135,10 +141,17 @@ class VCCCommandsMixin:
 
         # Try a dry-run render, just to catch bad placeholders early.
         try:
-            test_name = template.format(user=ctx.author.display_name, id=ctx.author.id)
+            tag = str(ctx.author)
+            # Use counter=1 as a dummy for validation
+            test_name = template.format(
+                user=ctx.author.display_name,
+                id=ctx.author.id,
+                tag=tag,
+                counter=1,
+            )
         except Exception:
             await ctx.send(
-                "Template is invalid. You can use `{user}` and `{id}` placeholders."
+                "Template is invalid. You can use `{user}`, `{id}`, `{tag}`, and `{counter}` placeholders."
             )
             return
 

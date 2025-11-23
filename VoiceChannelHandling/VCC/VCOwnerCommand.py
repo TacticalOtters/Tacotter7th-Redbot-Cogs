@@ -97,14 +97,19 @@ class VCOwnerCommandsMixin:
             deafen_members=True,
         )
 
+        name_template = await self.get_name_template(guild)
+        counter = await self.get_next_counter(guild)
+        new_name = self._render_channel_name(name_template, new_owner, counter)
+
         try:
             await channel.edit(
+                name=new_name,
                 overwrites=overwrites,
                 reason="Temporary voice channel ownership transfer.",
             )
         except discord.HTTPException:
             await ctx.send(
-                "Failed to update channel permissions.",
+                "Failed to update channel permissions or rename the channel.",
                 ephemeral=True,
             )
             return
@@ -115,6 +120,7 @@ class VCOwnerCommandsMixin:
 
         await ctx.send(
             f"Ownership of this temporary voice channel has been transferred to {new_owner.mention}.",
+            f"New name: `{new_name}`",
             ephemeral=True,
         )
 

@@ -1,155 +1,181 @@
 import asyncio
 import json
+import logging
+import os
 from pathlib import Path
-from typing import Dict, Optional, List
-
-# ==========================================================
-# Discord and red bot imports
-# ==========================================================
+from typing import Dict, List, Optional
 
 import discord
-from redbot.core import commands, Config
+from discord import app_commands
+from redbot.core import Config, commands
 from redbot.core.data_manager import cog_data_path
-
-# ==========================================================
-# Module imports
-# ==========================================================
 
 from .VCC.commands_mixin import VCCCommandsMixin
 from .VCC.VCOwnerCommand import VCOwnerCommandsMixin
 
 
-class VoiceChannelHandling(VCCCommandsMixin, VCOwnerCommandsMixin, commands.Cog):
-    """Temporary voice channel handling cog.
+log = logging.getLogger("red.VoiceChannelHandling")
 
-    Responsibilities:
-    - Listen to voice state updates.
-    - Create a temporary voice channel when a user joins the configured
-      'creation lobby' voice channel.
-    - Copy base permissions from the creation lobby and grant the joining user
-      management permissions for their temp channel.
-    - Track temporary channels per guild.
-    - Delete a temporary channel if it is empty and stays empty for a delay.
-    - Provide a JSON-based per-guild configuration file.
-    """
+
+class VoiceChannelHandling(VCCCommandsMixin, VCOwnerCommandsMixin, commands.Cog):
+    """Temporary voice channel handling cog."""
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-        # Data path for JSON "DB" files, one per guild: <guild_id>.json
         self._data_path: Path = cog_data_path(self)
         self._data_path.mkdir(parents=True, exist_ok=True)
 
-        # Config: Red will store this as JSON per guild.
         self.config = Config.get_conf(
             self,
-            identifier=0x5643485F4D41494E_01,  # random unique int for this cog
+            identifier=0x5643485F4D41494E_01,
             force_registration=True,
         )
 
         default_guild = {
-            # ID of the "creation lobby" voice channel.
             "creation_channel_id": None,
-            # Template for new channel name: use {user} and/or {id}.
             "name_template": "{user}'s channel",
-            # Deletion delay for empty temp channels (seconds).
             "delete_delay": 10,
-            # Category ID where temp channels will be created (optional).
             "temp_category_id": None,
-            # List of channel IDs considered temporary for this guild.
             "temp_channels": [],
-            # Next counter value for {counter} placeholder.
             "counter": 1,
-            "owner_channels": {}, # key: str(user_id), value: channel_id
+            "owner_channels": {},
         }
 
         self.config.register_guild(**default_guild)
 
-        # In-memory tracking of scheduled deletion tasks.
-        # Key: channel_id, Value: asyncio.Task
         self._delete_tasks: Dict[int, asyncio.Task] = {}
+        self._guild_locks: Dict[int, asyncio.Lock] = {}
+
+    def cog_unload(self):
+        for task in self._delete_tasks.values():
+            if not task.done():
+                task.cancel()
+
+        self._delete_tasks.clear()
+        self._guild_locks.clear()
+
+    # ==========================================================
+    # Lock helpers
+    # ==========================================================
+
+    def _get_guild_lock(self, guild_id: int) -> asyncio.Lock:
+        lock = self._guild_locks.get(guild_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._guild_locks[guild_id] = lock
+        return lock
 
     # ==========================================================
     # JSON DB helpers
     # ==========================================================
 
     def _guild_db_path(self, guild_id: int) -> Path:
-        """Return the path to the JSON DB file for a guild."""
         return self._data_path / f"{guild_id}.json"
 
     def _write_guild_json(self, guild_id: int, data: dict) -> None:
-        """Write the JSON DB file for a guild."""
+        """Atomic JSON write. No half-written cursed files."""
         path = self._guild_db_path(guild_id)
-        with path.open("w", encoding="utf-8") as fp:
+        tmp_path = path.with_suffix(".json.tmp")
+
+        with tmp_path.open("w", encoding="utf-8") as fp:
             json.dump(data, fp, ensure_ascii=False, indent=2)
 
+        os.replace(tmp_path, path)
+
     def _read_guild_json(self, guild_id: int) -> Optional[dict]:
-        """Read the JSON DB file for a guild, if it exists."""
         path = self._guild_db_path(guild_id)
         if not path.is_file():
             return None
+
         try:
             with path.open("r", encoding="utf-8") as fp:
                 return json.load(fp)
         except Exception:
+            log.exception("Failed to read VCH JSON DB for guild %s", guild_id)
             return None
 
+    async def _write_guild_snapshot(self, guild: discord.Guild) -> None:
+        conf = self.config.guild(guild)
+
+        data = {
+            "guild_id": guild.id,
+            "voicecreateroom_id": await conf.creation_channel_id(),
+            "creation_channel_id": await conf.creation_channel_id(),
+            "name_template": await conf.name_template(),
+            "delete_delay": await conf.delete_delay(),
+            "temp_category_id": await conf.temp_category_id(),
+            "temp_channels": await conf.temp_channels(),
+            "owner_channels": await conf.owner_channels(),
+            "counter": await conf.counter(),
+        }
+
+        self._write_guild_json(guild.id, data)
+
     # ==========================================================
-    # Public helper API for command modules (VCC) to use later
+    # Public helper API
     # ==========================================================
 
     async def set_creation_channel(self, guild: discord.Guild, channel_id: Optional[int]) -> None:
-        """Set or clear the creation lobby voice channel for this guild."""
         await self.config.guild(guild).creation_channel_id.set(channel_id)
+        await self._write_guild_snapshot(guild)
 
     async def get_creation_channel_id(self, guild: discord.Guild) -> Optional[int]:
-        """Get the configured creation lobby voice channel ID for this guild."""
         return await self.config.guild(guild).creation_channel_id()
 
     async def set_name_template(self, guild: discord.Guild, template: str) -> None:
-        """Set the channel name template for this guild."""
         await self.config.guild(guild).name_template.set(template)
+        await self._write_guild_snapshot(guild)
 
     async def get_name_template(self, guild: discord.Guild) -> str:
-        """Get the channel name template for this guild."""
         return await self.config.guild(guild).name_template()
 
     async def set_delete_delay(self, guild: discord.Guild, delay: int) -> None:
-        """Set delete delay (seconds) for empty temp channels."""
+        delay = max(3, int(delay))
         await self.config.guild(guild).delete_delay.set(delay)
+        await self._write_guild_snapshot(guild)
 
     async def get_delete_delay(self, guild: discord.Guild) -> int:
-        """Get delete delay (seconds) for empty temp channels."""
-        return await self.config.guild(guild).delete_delay()
+        delay = await self.config.guild(guild).delete_delay()
+        return max(3, int(delay or 10))
 
     async def set_temp_category(self, guild: discord.Guild, category_id: Optional[int]) -> None:
-        """Set the category ID where temp channels will be created."""
         await self.config.guild(guild).temp_category_id.set(category_id)
+        await self._write_guild_snapshot(guild)
 
     async def get_temp_category(self, guild: discord.Guild) -> Optional[int]:
-        """Get the category ID where temp channels will be created."""
         return await self.config.guild(guild).temp_category_id()
 
     async def get_temp_channels(self, guild: discord.Guild) -> List[int]:
-        """Get the list of tracked temp channel IDs for this guild."""
-        return await self.config.guild(guild).temp_channels()
-    
+        channels = await self.config.guild(guild).temp_channels()
+        return list(dict.fromkeys(channels))
+
     async def get_next_counter(self, guild: discord.Guild) -> int:
-        """Get the next counter value for this guild and increment it."""
-        conf = self.config.guild(guild)
-        current = await conf.counter()
-        if current is None or current < 1:
-            current = 1
-        await conf.counter.set(current + 1)
-        return current
+        async with self._get_guild_lock(guild.id):
+            conf = self.config.guild(guild)
+            current = await conf.counter()
+
+            if current is None or current < 1:
+                current = 1
+
+            await conf.counter.set(current + 1)
+            return current
 
     # ==========================================================
-    # Hybrid command: SetupVCH (creates JSON DB + config)
+    # Setup command
     # ==========================================================
 
-    @commands.hybrid_command(name="setupvch")
+    @commands.hybrid_command(name="setupvch", description="Configure temporary voice channel handling.")
+    @app_commands.guild_only()
+    @app_commands.describe(
+        creator_room="Voice channel users join to create a temp channel.",
+        delete_delay="Seconds before empty temp channels are deleted.",
+        category="Optional category where temp channels are created.",
+        name_template="Template: {user}, {id}, {tag}, {counter}.",
+    )
     @commands.guild_only()
     @commands.admin_or_permissions(manage_guild=True)
+    @commands.bot_has_permissions(manage_channels=True, move_members=True)
     async def setupvch(
         self,
         ctx: commands.Context,
@@ -159,50 +185,20 @@ class VoiceChannelHandling(VCCCommandsMixin, VCOwnerCommandsMixin, commands.Cog)
         *,
         name_template: str = "{user}'s channel",
     ):
-        """Initial setup for VoiceChannelHandling.
-
-        This will:
-        - Store settings in Red's config.
-        - Create a JSON DB file named <guild_id>.json with:
-          - voicecreateroom_id
-          - name_template
-          - delete_delay
-          - temp_category_id
-        """
-
         guild = ctx.guild
         if guild is None:
             return
 
-        # Basic sanity for delete delay.
-        if delete_delay < 3:
-            delete_delay = 3
+        delete_delay = max(3, int(delete_delay))
+        target_category_id = category.id if category else creator_room.category_id
 
-        # Choose temp category: explicit argument or creator room's category.
-        if category is not None:
-            target_category_id = category.id
-        else:
-            target_category_id = creator_room.category_id
+        await self.config.guild(guild).creation_channel_id.set(creator_room.id)
+        await self.config.guild(guild).name_template.set(name_template)
+        await self.config.guild(guild).delete_delay.set(delete_delay)
+        await self.config.guild(guild).temp_category_id.set(target_category_id)
 
-        # Save to Red Config.
-        await self.set_creation_channel(guild, creator_room.id)
-        await self.set_name_template(guild, name_template)
-        await self.set_delete_delay(guild, delete_delay)
-        await self.set_temp_category(guild, target_category_id)
+        await self._write_guild_snapshot(guild)
 
-        # Build JSON payload.
-        db_data = {
-            "guild_id": guild.id,
-            "voicecreateroom_id": creator_room.id,
-            "name_template": name_template,
-            "delete_delay": delete_delay,
-            "temp_category_id": target_category_id,
-        }
-
-        # Write JSON DB file: <data folder>/<guild_id>.json
-        self._write_guild_json(guild.id, db_data)
-
-        # Feedback message
         temp_cat_text = "None"
         if target_category_id is not None:
             cat_obj = guild.get_channel(target_category_id)
@@ -210,16 +206,16 @@ class VoiceChannelHandling(VCCCommandsMixin, VCOwnerCommandsMixin, commands.Cog)
                 temp_cat_text = cat_obj.name
 
         await ctx.send(
-            "VoiceChannelHandling configured for this server.\n"
+            "VoiceChannelHandling configured.\n"
             f"- Creation room: {creator_room.mention}\n"
             f"- Name template: `{name_template}`\n"
-            f"- Delete delay: {delete_delay} seconds\n"
-            f"- Temp category: {temp_cat_text}\n"
+            f"- Delete delay: `{delete_delay}` seconds\n"
+            f"- Temp category: `{temp_cat_text}`\n"
             f"- JSON DB file: `{guild.id}.json`"
         )
 
     # ==========================================================
-    # Voice state handling
+    # Voice state listener
     # ==========================================================
 
     @commands.Cog.listener()
@@ -229,10 +225,10 @@ class VoiceChannelHandling(VCCCommandsMixin, VCOwnerCommandsMixin, commands.Cog)
         before: discord.VoiceState,
         after: discord.VoiceState,
     ):
-        """Main listener for handling temp channel lifecycle."""
-
-        # Ignore bots by default; change this if you want them to trigger channels.
         if member.bot:
+            return
+
+        if before.channel == after.channel:
             return
 
         guild = member.guild
@@ -241,28 +237,25 @@ class VoiceChannelHandling(VCCCommandsMixin, VCOwnerCommandsMixin, commands.Cog)
 
         guild_conf = self.config.guild(guild)
         creation_channel_id = await guild_conf.creation_channel_id()
+
         if creation_channel_id is None:
-            # Cog is not configured for this guild.
             return
 
-        temp_channels = await guild_conf.temp_channels()
-        temp_channels_set = set(temp_channels)
+        temp_channels = set(await guild_conf.temp_channels())
 
-        # 1) Handle leaving a temp channel: schedule deletion if empty.
-        if before.channel and before.channel.id in temp_channels_set:
-            if len(before.channel.members) == 0:
+        if before.channel and before.channel.id in temp_channels:
+            if isinstance(before.channel, discord.VoiceChannel) and len(before.channel.members) == 0:
                 await self._schedule_delete_temp_channel(before.channel)
 
-        # 2) Handle joining an existing temp channel: cancel deletion.
-        if after.channel and after.channel.id in temp_channels_set:
+        if after.channel and after.channel.id in temp_channels:
             self._cancel_delete_task(after.channel.id)
 
-        # 3) Handle joining the creation lobby: create a new temp channel.
         if after.channel and after.channel.id == creation_channel_id:
-            await self._handle_creation_join(member, after.channel)
+            if isinstance(after.channel, discord.VoiceChannel):
+                await self._handle_creation_join(member, after.channel)
 
     # ==========================================================
-    # Temp channel lifecycle helpers
+    # Creation logic
     # ==========================================================
 
     async def _handle_creation_join(
@@ -270,180 +263,252 @@ class VoiceChannelHandling(VCCCommandsMixin, VCOwnerCommandsMixin, commands.Cog)
         member: discord.Member,
         base_channel: discord.VoiceChannel,
     ) -> None:
-        """Create or reuse a temp channel for `member` and move them into it."""
         guild = base_channel.guild
-        guild_conf = self.config.guild(guild)
 
-        # 1) Check if this user already has a temp channel
-        existing_id = await self._get_owner_channel_id(guild, member.id)
-        if existing_id is not None:
-            existing_channel = guild.get_channel(existing_id)
-            if isinstance(existing_channel, discord.VoiceChannel):
-                # Cancel pending delete for that channel, if any
-                self._cancel_delete_task(existing_channel.id)
+        async with self._get_guild_lock(guild.id):
+            existing_id = await self._get_owner_channel_id(guild, member.id)
 
-                # Just move them back into their existing channel
-                try:
-                    await member.move_to(existing_channel)
-                except discord.HTTPException:
-                    pass
+            if existing_id is not None:
+                existing_channel = guild.get_channel(existing_id)
+
+                if isinstance(existing_channel, discord.VoiceChannel):
+                    self._cancel_delete_task(existing_channel.id)
+
+                    try:
+                        await member.move_to(
+                            existing_channel,
+                            reason="Moved member back to their existing temporary voice channel.",
+                        )
+                    except discord.Forbidden:
+                        log.warning("Missing permission to move %s in guild %s", member.id, guild.id)
+                    except discord.HTTPException:
+                        log.exception("Failed to move %s to existing temp channel %s", member.id, existing_id)
+
+                    return
+
+            me = guild.me
+            if me is None:
+                log.warning("Could not resolve bot member in guild %s", guild.id)
                 return
-            # If mapping was stale, we cleaned it in _get_owner_channel_id
 
-        # 2) No existing channel: create a new one
-        name_template = await guild_conf.name_template()
-        counter = await self.get_next_counter(guild)
-        channel_name = self._render_channel_name(name_template, member, counter)
+            perms = me.guild_permissions
+            if not perms.manage_channels:
+                log.warning("Missing Manage Channels in guild %s", guild.id)
+                return
 
-        overwrites = base_channel.overwrites.copy()
-        overwrites[member] = discord.PermissionOverwrite(
-            manage_channels=True,
-            move_members=True,
-            mute_members=True,
-            deafen_members=True,
-        )
+            if not perms.move_members:
+                log.warning("Missing Move Members in guild %s", guild.id)
+                return
 
-        me = guild.me
-        if not me.guild_permissions.manage_channels or not me.guild_permissions.move_members:
-            return
+            guild_conf = self.config.guild(guild)
 
-        temp_category_id = await guild_conf.temp_category_id()
-        category = None
+            name_template = await guild_conf.name_template()
+            counter = await self.get_next_counter(guild)
+            channel_name = self._render_channel_name(name_template, member, counter)
+
+            overwrites = base_channel.overwrites.copy()
+            overwrites[member] = discord.PermissionOverwrite(
+                view_channel=True,
+                connect=True,
+                speak=True,
+                manage_channels=True,
+                move_members=True,
+                mute_members=True,
+                deafen_members=True,
+            )
+
+            category = await self._resolve_temp_category(guild, base_channel)
+
+            try:
+                new_channel = await guild.create_voice_channel(
+                    name=channel_name,
+                    category=category,
+                    overwrites=overwrites,
+                    reason=f"Temporary voice channel created for {member} ({member.id}).",
+                )
+            except discord.Forbidden:
+                log.warning("Missing permission to create temp voice channel in guild %s", guild.id)
+                return
+            except discord.HTTPException:
+                log.exception("Failed to create temp voice channel in guild %s", guild.id)
+                return
+
+            await self._add_temp_channel(guild, new_channel.id)
+            await self._set_owner_channel(guild, member.id, new_channel.id)
+            await self._write_guild_snapshot(guild)
+
+            try:
+                await member.move_to(
+                    new_channel,
+                    reason="Moved member into their temporary voice channel.",
+                )
+            except discord.Forbidden:
+                log.warning("Missing permission to move %s into temp channel %s", member.id, new_channel.id)
+                await self._schedule_delete_temp_channel(new_channel)
+                return
+            except discord.HTTPException:
+                log.exception("Failed to move %s into temp channel %s", member.id, new_channel.id)
+                await self._schedule_delete_temp_channel(new_channel)
+                return
+
+            if len(new_channel.members) == 0:
+                await self._schedule_delete_temp_channel(new_channel)
+
+    async def _resolve_temp_category(
+        self,
+        guild: discord.Guild,
+        base_channel: discord.VoiceChannel,
+    ) -> Optional[discord.CategoryChannel]:
+        temp_category_id = await self.config.guild(guild).temp_category_id()
+
         if temp_category_id is not None:
             cat_obj = guild.get_channel(temp_category_id)
             if isinstance(cat_obj, discord.CategoryChannel):
-                category = cat_obj
-        if category is None:
-            category = base_channel.category
+                return cat_obj
 
-        new_channel = await guild.create_voice_channel(
-            name=channel_name,
-            category=category,
-            overwrites=overwrites,
-            reason="Temporary voice channel created by VoiceChannelHandling cog.",
-        )
-
-        await self._add_temp_channel(guild, new_channel.id)
-        await self._set_owner_channel(guild, member.id, new_channel.id)
-
-        try:
-            await member.move_to(new_channel)
-        except discord.HTTPException:
-            pass
+        return base_channel.category
 
     def _render_channel_name(self, template: str, member: discord.Member, counter: int) -> str:
-        """Render channel name, falling back to a safe default if needed.
-
-        Available placeholders:
-        - {user}: member.display_name
-        - {id}: member.id
-        - {tag}: str(member) (usually Name#1234)
-        - {counter}: auto-incrementing integer per guild
-        """
         tag = str(member)
+
         try:
-            return template.format(
+            rendered = template.format(
                 user=member.display_name,
                 id=member.id,
                 tag=tag,
                 counter=counter,
             )
         except Exception:
-            return f"{member.display_name}'s channel"
+            rendered = f"{member.display_name}'s channel"
+
+        return self._sanitize_channel_name(rendered, member)
+
+    @staticmethod
+    def _sanitize_channel_name(name: str, member: discord.Member) -> str:
+        name = name.replace("\n", " ").replace("\r", " ").strip()
+
+        if not name:
+            name = f"{member.display_name}'s channel"
+
+        return name[:100]
+
+    # ==========================================================
+    # Deletion logic
+    # ==========================================================
 
     async def _schedule_delete_temp_channel(self, channel: discord.VoiceChannel) -> None:
-        """Schedule deletion of a temp channel if it remains empty."""
         if channel.id in self._delete_tasks:
-            # Already scheduled.
             return
 
-        # Only schedule if it is actually empty at the time of scheduling.
         if len(channel.members) != 0:
             return
 
-        task = asyncio.create_task(self._delete_temp_channel_after_delay(channel))
+        task = asyncio.create_task(
+            self._delete_temp_channel_after_delay(channel.guild.id, channel.id)
+        )
+
         self._delete_tasks[channel.id] = task
 
-    async def _delete_temp_channel_after_delay(self, channel: discord.VoiceChannel) -> None:
-        """Wait a configured delay, then delete the channel if still empty."""
-        guild = channel.guild
-        if guild is None:
-            return
-
-        delay = await self.get_delete_delay(guild)
-
+    async def _delete_temp_channel_after_delay(self, guild_id: int, channel_id: int) -> None:
         try:
-            await asyncio.sleep(delay)
-
-            # Channel might already be gone.
-            guild = channel.guild
+            guild = self.bot.get_guild(guild_id)
             if guild is None:
                 return
 
-            # Re-check if channel is still empty.
-            if len(channel.members) == 0:
-                channel_id = channel.id
+            delay = await self.get_delete_delay(guild)
+            await asyncio.sleep(delay)
 
-                try:
-                    await channel.delete(reason="Temporary voice channel empty.")
-                except discord.NotFound:
-                    # Already deleted.
-                    pass
+            guild = self.bot.get_guild(guild_id)
+            if guild is None:
+                return
 
-                # Remove from config list.
+            channel = guild.get_channel(channel_id)
+
+            if not isinstance(channel, discord.VoiceChannel):
                 await self._remove_temp_channel(guild, channel_id)
                 await self._clear_owner_by_channel(guild, channel_id)
+                await self._write_guild_snapshot(guild)
+                return
 
+            if len(channel.members) != 0:
+                return
+
+            try:
+                await channel.delete(reason="Temporary voice channel empty.")
+            except discord.NotFound:
+                pass
+            except discord.Forbidden:
+                log.warning("Missing permission to delete temp channel %s in guild %s", channel_id, guild_id)
+                return
+            except discord.HTTPException:
+                log.exception("Failed to delete temp channel %s in guild %s", channel_id, guild_id)
+                return
+
+            await self._remove_temp_channel(guild, channel_id)
+            await self._clear_owner_by_channel(guild, channel_id)
+            await self._write_guild_snapshot(guild)
+
+        except asyncio.CancelledError:
+            raise
         finally:
-            # Clean up task reference.
-            self._delete_tasks.pop(getattr(channel, "id", None), None)
+            self._delete_tasks.pop(channel_id, None)
 
     def _cancel_delete_task(self, channel_id: int) -> None:
-        """Cancel a pending scheduled deletion for the given channel."""
         task = self._delete_tasks.pop(channel_id, None)
+
         if task and not task.done():
             task.cancel()
 
     # ==========================================================
-    # Config helpers for temp channel list
+    # Config helpers
     # ==========================================================
 
     async def _add_temp_channel(self, guild: discord.Guild, channel_id: int) -> None:
-        """Add a channel to the guild's temp channel tracking list."""
         async with self.config.guild(guild).temp_channels() as channels:
             if channel_id not in channels:
                 channels.append(channel_id)
 
     async def _remove_temp_channel(self, guild: discord.Guild, channel_id: int) -> None:
-        """Remove a channel from the guild's temp channel tracking list."""
         async with self.config.guild(guild).temp_channels() as channels:
-            if channel_id in channels:
+            while channel_id in channels:
                 channels.remove(channel_id)
-    
+
     async def _set_owner_channel(self, guild: discord.Guild, user_id: int, channel_id: int) -> None:
-        """Set or update the temp channel owned by a specific user."""
         async with self.config.guild(guild).owner_channels() as owners:
             owners[str(user_id)] = channel_id
 
     async def _get_owner_channel_id(self, guild: discord.Guild, user_id: int) -> Optional[int]:
-        """Get the temp channel ID owned by this user, if any and still valid."""
         owners = await self.config.guild(guild).owner_channels()
         chan_id = owners.get(str(user_id))
+
         if chan_id is None:
             return None
 
-        channel = guild.get_channel(chan_id)
-        if not isinstance(channel, discord.VoiceChannel):
-            # Channel no longer exists, clean up mapping
+        try:
+            chan_id = int(chan_id)
+        except (TypeError, ValueError):
             async with self.config.guild(guild).owner_channels() as owners_mut:
                 owners_mut.pop(str(user_id), None)
+            return None
+
+        channel = guild.get_channel(chan_id)
+
+        if not isinstance(channel, discord.VoiceChannel):
+            async with self.config.guild(guild).owner_channels() as owners_mut:
+                owners_mut.pop(str(user_id), None)
+
+            await self._remove_temp_channel(guild, chan_id)
+            await self._write_guild_snapshot(guild)
             return None
 
         return chan_id
 
     async def _clear_owner_by_channel(self, guild: discord.Guild, channel_id: int) -> None:
-        """Remove any owner entries pointing to a specific channel."""
         async with self.config.guild(guild).owner_channels() as owners:
-            to_delete = [uid for uid, cid in owners.items() if cid == channel_id]
+            to_delete = [
+                uid for uid, cid in owners.items()
+                if str(cid) == str(channel_id)
+            ]
+
             for uid in to_delete:
                 owners.pop(uid, None)

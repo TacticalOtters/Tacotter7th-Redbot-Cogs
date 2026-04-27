@@ -24,7 +24,7 @@ class VoiceChannelHandling(VCCCommandsMixin, VCOwnerCommandsMixin, commands.Cog)
     - Creates a temporary voice channel when a user joins the configured creator room.
     - Moves the user into their temp channel.
     - Reuses the user's existing temp channel if it still exists.
-    - Deletes empty temp channels after a configurable delay.
+    - Deletes temp channels after a configurable delay when no human members remain.
     - Tracks state in Red Config and mirrors a per-guild JSON snapshot.
     """
 
@@ -265,9 +265,10 @@ class VoiceChannelHandling(VCCCommandsMixin, VCOwnerCommandsMixin, commands.Cog)
 
         temp_channels = set(await guild_conf.temp_channels())
 
-        # Leaving a tracked temp channel: schedule deletion if empty.
+        # Leaving a tracked temp channel: schedule deletion if no human members remain.
+        # Music bots do not keep temp channels alive. Bot-only channel = empty.
         if before.channel and before.channel.id in temp_channels:
-            if isinstance(before.channel, discord.VoiceChannel) and len(before.channel.members) == 0:
+            if isinstance(before.channel, discord.VoiceChannel) and not self._has_human_members(before.channel):
                 await self._schedule_delete_temp_channel(before.channel)
 
         # Joining a tracked temp channel: cancel pending deletion.
@@ -412,7 +413,7 @@ class VoiceChannelHandling(VCCCommandsMixin, VCOwnerCommandsMixin, commands.Cog)
                 await self._schedule_delete_temp_channel(new_channel)
                 return
 
-            if len(new_channel.members) == 0:
+            if not self._has_human_members(new_channel):
                 await self._schedule_delete_temp_channel(new_channel)
 
     async def _resolve_temp_category(
@@ -453,6 +454,11 @@ class VoiceChannelHandling(VCCCommandsMixin, VCOwnerCommandsMixin, commands.Cog)
 
         return name[:100]
 
+    @staticmethod
+    def _has_human_members(channel: discord.VoiceChannel) -> bool:
+        """Return True when at least one non-bot member is inside the channel."""
+        return any(not member.bot for member in channel.members)
+
     # ==========================================================
     # Deletion logic
     # ==========================================================
@@ -461,7 +467,7 @@ class VoiceChannelHandling(VCCCommandsMixin, VCOwnerCommandsMixin, commands.Cog)
         if channel.id in self._delete_tasks:
             return
 
-        if len(channel.members) != 0:
+        if self._has_human_members(channel):
             return
 
         task = asyncio.create_task(
@@ -491,11 +497,11 @@ class VoiceChannelHandling(VCCCommandsMixin, VCOwnerCommandsMixin, commands.Cog)
                 await self._write_guild_snapshot(guild)
                 return
 
-            if len(channel.members) != 0:
+            if self._has_human_members(channel):
                 return
 
             try:
-                await channel.delete(reason="Temporary voice channel empty.")
+                await channel.delete(reason="Temporary voice channel has no human members.")
             except discord.NotFound:
                 pass
             except discord.Forbidden:

@@ -18,7 +18,15 @@ log = logging.getLogger("red.VoiceChannelHandling")
 
 
 class VoiceChannelHandling(VCCCommandsMixin, VCOwnerCommandsMixin, commands.Cog):
-    """Temporary voice channel handling cog."""
+    """Temporary voice channel handling cog.
+
+    This cog:
+    - Creates a temporary voice channel when a user joins the configured creator room.
+    - Moves the user into their temp channel.
+    - Reuses the user's existing temp channel if it still exists.
+    - Deletes empty temp channels after a configurable delay.
+    - Tracks state in Red Config and mirrors a per-guild JSON snapshot.
+    """
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -74,7 +82,7 @@ class VoiceChannelHandling(VCCCommandsMixin, VCOwnerCommandsMixin, commands.Cog)
         return self._data_path / f"{guild_id}.json"
 
     def _write_guild_json(self, guild_id: int, data: dict) -> None:
-        """Atomic JSON write. No half-written cursed files."""
+        """Atomic JSON write so a crash does not leave a half-written file."""
         path = self._guild_db_path(guild_id)
         tmp_path = path.with_suffix(".json.tmp")
 
@@ -113,7 +121,7 @@ class VoiceChannelHandling(VCCCommandsMixin, VCOwnerCommandsMixin, commands.Cog)
         self._write_guild_json(guild.id, data)
 
     # ==========================================================
-    # Public helper API
+    # Public helper API for VCC command modules
     # ==========================================================
 
     async def set_creation_channel(self, guild: discord.Guild, channel_id: Optional[int]) -> None:
@@ -150,16 +158,30 @@ class VoiceChannelHandling(VCCCommandsMixin, VCOwnerCommandsMixin, commands.Cog)
         channels = await self.config.guild(guild).temp_channels()
         return list(dict.fromkeys(channels))
 
+    async def _get_next_counter_unlocked(self, guild: discord.Guild) -> int:
+        """Increment counter without taking the guild lock.
+
+        Only call this when:
+        - You are already inside the guild lock, OR
+        - You do not need locking.
+        """
+        conf = self.config.guild(guild)
+        current = await conf.counter()
+
+        if current is None or current < 1:
+            current = 1
+
+        await conf.counter.set(current + 1)
+        return current
+
     async def get_next_counter(self, guild: discord.Guild) -> int:
+        """Get the next counter value safely.
+
+        This public wrapper takes the guild lock. Do not call this from code that
+        already holds the same guild lock, because asyncio.Lock is not re-entrant.
+        """
         async with self._get_guild_lock(guild.id):
-            conf = self.config.guild(guild)
-            current = await conf.counter()
-
-            if current is None or current < 1:
-                current = 1
-
-            await conf.counter.set(current + 1)
-            return current
+            return await self._get_next_counter_unlocked(guild)
 
     # ==========================================================
     # Setup command
@@ -243,13 +265,16 @@ class VoiceChannelHandling(VCCCommandsMixin, VCOwnerCommandsMixin, commands.Cog)
 
         temp_channels = set(await guild_conf.temp_channels())
 
+        # Leaving a tracked temp channel: schedule deletion if empty.
         if before.channel and before.channel.id in temp_channels:
             if isinstance(before.channel, discord.VoiceChannel) and len(before.channel.members) == 0:
                 await self._schedule_delete_temp_channel(before.channel)
 
+        # Joining a tracked temp channel: cancel pending deletion.
         if after.channel and after.channel.id in temp_channels:
             self._cancel_delete_task(after.channel.id)
 
+        # Joining the creator room: create/reuse temp channel.
         if after.channel and after.channel.id == creation_channel_id:
             if isinstance(after.channel, discord.VoiceChannel):
                 await self._handle_creation_join(member, after.channel)
@@ -280,9 +305,19 @@ class VoiceChannelHandling(VCCCommandsMixin, VCOwnerCommandsMixin, commands.Cog)
                             reason="Moved member back to their existing temporary voice channel.",
                         )
                     except discord.Forbidden:
-                        log.warning("Missing permission to move %s in guild %s", member.id, guild.id)
+                        log.warning(
+                            "Missing permission to move user %s to existing temp channel %s in guild %s",
+                            member.id,
+                            existing_id,
+                            guild.id,
+                        )
                     except discord.HTTPException:
-                        log.exception("Failed to move %s to existing temp channel %s", member.id, existing_id)
+                        log.exception(
+                            "Failed to move user %s to existing temp channel %s in guild %s",
+                            member.id,
+                            existing_id,
+                            guild.id,
+                        )
 
                     return
 
@@ -303,7 +338,13 @@ class VoiceChannelHandling(VCCCommandsMixin, VCOwnerCommandsMixin, commands.Cog)
             guild_conf = self.config.guild(guild)
 
             name_template = await guild_conf.name_template()
-            counter = await self.get_next_counter(guild)
+
+            # IMPORTANT:
+            # We are already inside the guild lock here.
+            # Do not call get_next_counter(), because that would try to acquire
+            # the same asyncio.Lock again and deadlock.
+            counter = await self._get_next_counter_unlocked(guild)
+
             channel_name = self._render_channel_name(name_template, member, counter)
 
             overwrites = base_channel.overwrites.copy()
@@ -320,12 +361,22 @@ class VoiceChannelHandling(VCCCommandsMixin, VCOwnerCommandsMixin, commands.Cog)
             category = await self._resolve_temp_category(guild, base_channel)
 
             try:
+                log.info("Creating temp voice channel for user %s in guild %s", member.id, guild.id)
+
                 new_channel = await guild.create_voice_channel(
                     name=channel_name,
                     category=category,
                     overwrites=overwrites,
                     reason=f"Temporary voice channel created for {member} ({member.id}).",
                 )
+
+                log.info(
+                    "Created temp voice channel %s for user %s in guild %s",
+                    new_channel.id,
+                    member.id,
+                    guild.id,
+                )
+
             except discord.Forbidden:
                 log.warning("Missing permission to create temp voice channel in guild %s", guild.id)
                 return
@@ -343,11 +394,21 @@ class VoiceChannelHandling(VCCCommandsMixin, VCOwnerCommandsMixin, commands.Cog)
                     reason="Moved member into their temporary voice channel.",
                 )
             except discord.Forbidden:
-                log.warning("Missing permission to move %s into temp channel %s", member.id, new_channel.id)
+                log.warning(
+                    "Missing permission to move user %s into temp channel %s in guild %s",
+                    member.id,
+                    new_channel.id,
+                    guild.id,
+                )
                 await self._schedule_delete_temp_channel(new_channel)
                 return
             except discord.HTTPException:
-                log.exception("Failed to move %s into temp channel %s", member.id, new_channel.id)
+                log.exception(
+                    "Failed to move user %s into temp channel %s in guild %s",
+                    member.id,
+                    new_channel.id,
+                    guild.id,
+                )
                 await self._schedule_delete_temp_channel(new_channel)
                 return
 
@@ -489,6 +550,7 @@ class VoiceChannelHandling(VCCCommandsMixin, VCOwnerCommandsMixin, commands.Cog)
         except (TypeError, ValueError):
             async with self.config.guild(guild).owner_channels() as owners_mut:
                 owners_mut.pop(str(user_id), None)
+            await self._write_guild_snapshot(guild)
             return None
 
         channel = guild.get_channel(chan_id)
